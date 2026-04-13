@@ -51,3 +51,6 @@ settings/
 wgp_config.json
 plugins_local.json
 loras_url_cache.json
+
+# BetterClip
+betterclip_token.txt

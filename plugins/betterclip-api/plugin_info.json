@@ -1,0 +1,8 @@
+{
+  "name": "BetterClip API",
+  "author": "atkati",
+  "version": "0.1.0",
+  "description": "FastAPI sidecar exposing REST + WebSocket API for BetterClip Studio on localhost:8765",
+  "date": "2026-04-13",
+  "wan2gp_version": ""
+}
