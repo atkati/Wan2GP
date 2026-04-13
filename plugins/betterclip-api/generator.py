@@ -1,13 +1,15 @@
 """
 BetterClip API — Image generation via WanGP Session API
 
-Uses the shared.api.WanGPSession to submit image generation tasks
-to the Wan2GP engine. Manages job queue and result retrieval.
+Uses the shared.api.WanGPSession to submit image generation tasks.
+After generation, copies/converts the result to the target output_dir as PNG.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -15,7 +17,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-# Lazy import to avoid circular deps at module load time
 _session = None
 _session_lock = threading.Lock()
 
@@ -23,7 +24,7 @@ _session_lock = threading.Lock()
 @dataclass
 class GenerationJob:
     job_id: str
-    status: str = "queued"  # queued, running, completed, failed
+    status: str = "queued"
     prompt: str = ""
     model_type: str = ""
     output_path: str = ""
@@ -32,12 +33,10 @@ class GenerationJob:
     created_at: float = field(default_factory=time.time)
 
 
-# In-memory job store
 _jobs: dict[str, GenerationJob] = {}
 _jobs_lock = threading.Lock()
 
 
-# Model info database
 IMAGE_MODELS = {
     "flux_schnell": {
         "type": "flux_schnell",
@@ -79,7 +78,6 @@ IMAGE_MODELS = {
 
 
 def get_available_models(model_types_handlers: dict) -> list[dict]:
-    """Return info for models that are actually available in this Wan2GP install."""
     available = []
     for model_key, info in IMAGE_MODELS.items():
         if model_key in model_types_handlers:
@@ -88,13 +86,25 @@ def get_available_models(model_types_handlers: dict) -> list[dict]:
 
 
 def _get_session():
-    """Lazy-init a WanGPSession that reuses the running Wan2GP instance."""
     global _session
     with _session_lock:
         if _session is None:
             from shared.api import WanGPSession
             _session = WanGPSession(console_output=False)
         return _session
+
+
+def _extract_first_frame(video_path: str, output_png: str) -> bool:
+    """Extract first frame from a video file as PNG using FFmpeg."""
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vframes", "1", "-f", "image2", output_png
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        return result.returncode == 0 and os.path.isfile(output_png)
+    except Exception:
+        return False
 
 
 def submit_generation(
@@ -108,8 +118,8 @@ def submit_generation(
     output_dir: str = "",
     image_guide: Optional[str] = None,
     reference_strength: float = 0.35,
+    output_filename: str = "",
 ) -> str:
-    """Submit an image generation job. Returns job_id."""
     job_id = str(uuid.uuid4())[:8]
     job = GenerationJob(
         job_id=job_id,
@@ -117,20 +127,17 @@ def submit_generation(
         prompt=prompt,
         model_type=model_type,
     )
-
     with _jobs_lock:
         _jobs[job_id] = job
 
-    # Run in background thread
     thread = threading.Thread(
         target=_run_generation,
         args=(job, prompt, negative_prompt, model_type, resolution,
               num_inference_steps, seed, guidance_scale, output_dir,
-              image_guide, reference_strength),
+              image_guide, reference_strength, output_filename),
         daemon=True,
     )
     thread.start()
-
     return job_id
 
 
@@ -146,15 +153,14 @@ def _run_generation(
     output_dir: str,
     image_guide: Optional[str],
     reference_strength: float,
+    output_filename: str,
 ):
-    """Background thread: run the generation via WanGPSession."""
     try:
         job.status = "running"
         job.progress = 10
 
         session = _get_session()
 
-        # Build task settings
         settings: dict[str, Any] = {
             "model_type": model_type,
             "prompt": prompt,
@@ -163,49 +169,73 @@ def _run_generation(
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
             "batch_size": 1,
+            "video_length": 1,  # Force single frame = image
         }
 
         if seed >= 0:
             settings["seed"] = seed
 
-        # Image guide for img2img
         if image_guide and os.path.isfile(image_guide):
             settings["image_guide"] = image_guide
             settings["denoising_strength"] = reference_strength
 
-        # Set output directory
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-            settings["save_path"] = output_dir
-
         job.progress = 20
 
-        # Submit and wait
         result = session.run_task(settings)
 
-        job.progress = 90
+        job.progress = 80
 
         if result.success and result.generated_files:
-            job.output_path = result.generated_files[0]
+            source_file = result.generated_files[0]
+            print(f"[betterclip-gen] Generated: {source_file}")
+
+            # Copy/convert to target directory as PNG
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                fname = output_filename or f"frame_{job.job_id}.png"
+                target_path = os.path.join(output_dir, fname)
+
+                ext = os.path.splitext(source_file)[1].lower()
+                if ext in ('.png', '.jpg', '.jpeg', '.webp'):
+                    # Already an image — just copy
+                    shutil.copy2(source_file, target_path)
+                    job.output_path = target_path
+                elif ext in ('.mp4', '.webm', '.mkv'):
+                    # Video — extract first frame
+                    if _extract_first_frame(source_file, target_path):
+                        job.output_path = target_path
+                    else:
+                        # Fallback: copy as-is
+                        target_path = os.path.join(output_dir, fname.replace('.png', ext))
+                        shutil.copy2(source_file, target_path)
+                        job.output_path = target_path
+                else:
+                    shutil.copy2(source_file, target_path)
+                    job.output_path = target_path
+
+                print(f"[betterclip-gen] Saved to: {job.output_path}")
+            else:
+                job.output_path = source_file
+
             job.status = "completed"
             job.progress = 100
         else:
             errors = "; ".join(str(e) for e in result.errors) if result.errors else "Unknown error"
             job.status = "failed"
             job.error = errors
+            print(f"[betterclip-gen] FAILED: {errors}")
 
     except Exception as e:
         job.status = "failed"
         job.error = str(e)
+        print(f"[betterclip-gen] EXCEPTION: {e}")
 
 
 def get_job(job_id: str) -> Optional[GenerationJob]:
-    """Get job status."""
     with _jobs_lock:
         return _jobs.get(job_id)
 
 
 def get_all_jobs() -> list[GenerationJob]:
-    """Get all jobs."""
     with _jobs_lock:
         return list(_jobs.values())

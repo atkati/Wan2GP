@@ -30,6 +30,7 @@ class GenerateRequest(BaseModel):
     seed: int = -1
     guidance_scale: float = 7.5
     output_dir: str = ""
+    output_filename: str = ""
     image_guide: Optional[str] = None
     reference_strength: float = 0.35
 
@@ -111,6 +112,7 @@ def create_app(engine_globals: dict | None = None) -> FastAPI:
             seed=req.seed,
             guidance_scale=req.guidance_scale,
             output_dir=req.output_dir,
+            output_filename=req.output_filename,
             image_guide=req.image_guide,
             reference_strength=req.reference_strength,
         )
