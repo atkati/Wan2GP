@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 _session = None
 _session_lock = threading.Lock()
+_queue_lock = threading.Lock()  # Ensures sequential generation — one at a time
+_worker_running = False
 
 
 @dataclass
@@ -35,6 +37,7 @@ class GenerationJob:
 
 _jobs: dict[str, GenerationJob] = {}
 _jobs_lock = threading.Lock()
+_pending_queue: list[tuple] = []  # Queue of (job, args) tuples
 
 
 IMAGE_MODELS = {
@@ -120,6 +123,8 @@ def submit_generation(
     reference_strength: float = 0.35,
     output_filename: str = "",
 ) -> str:
+    global _worker_running
+
     job_id = str(uuid.uuid4())[:8]
     job = GenerationJob(
         job_id=job_id,
@@ -130,15 +135,32 @@ def submit_generation(
     with _jobs_lock:
         _jobs[job_id] = job
 
-    thread = threading.Thread(
-        target=_run_generation,
-        args=(job, prompt, negative_prompt, model_type, resolution,
-              num_inference_steps, seed, guidance_scale, output_dir,
-              image_guide, reference_strength, output_filename),
-        daemon=True,
-    )
-    thread.start()
+    args = (job, prompt, negative_prompt, model_type, resolution,
+            num_inference_steps, seed, guidance_scale, output_dir,
+            image_guide, reference_strength, output_filename)
+
+    _pending_queue.append(args)
+
+    # Start worker thread if not already running
+    if not _worker_running:
+        _worker_running = True
+        thread = threading.Thread(target=_worker_loop, daemon=True)
+        thread.start()
+
     return job_id
+
+
+def _worker_loop():
+    """Process generation jobs one at a time, sequentially."""
+    global _worker_running
+    try:
+        while True:
+            if not _pending_queue:
+                break
+            args = _pending_queue.pop(0)
+            _run_generation(*args)
+    finally:
+        _worker_running = False
 
 
 def _run_generation(
