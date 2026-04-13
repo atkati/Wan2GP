@@ -32,6 +32,7 @@ class BetterClipAPIPlugin(WAN2GPPlugin):
         super().__init__()
         self._server_thread: threading.Thread | None = None
         self._actual_port: int = PORT
+        self._started: bool = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -50,6 +51,11 @@ class BetterClipAPIPlugin(WAN2GPPlugin):
         This is the right moment to start the server because globals
         have been injected by PluginManager at this point.
         """
+        # Guard against double invocation by Wan2GP
+        if self._started:
+            return {}
+        self._started = True
+
         engine_globals = {
             "model_types_handlers": getattr(self, "model_types_handlers", {}),
             "families_infos": getattr(self, "families_infos", {}),
