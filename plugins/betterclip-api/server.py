@@ -3,28 +3,38 @@ BetterClip API — FastAPI server
 
 Runs as a sidecar alongside Wan2GP's Gradio UI.
 Endpoints:
-  GET /health   — Liveness check
-  GET /models   — List locally available model families and types
+  GET  /health           — Liveness check
+  GET  /models           — List locally available model families and types
+  GET  /generate/models  — List image models with speed/quality info
+  POST /generate         — Submit image generation job
+  GET  /jobs/{job_id}    — Check job status and get result
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from typing import Optional
 
 from .config import API_VERSION, get_or_create_token
 from .auth import TokenAuthMiddleware
+from .generator import get_available_models, submit_generation, get_job, IMAGE_MODELS
+
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    negative_prompt: str = ""
+    model_type: str = "flux_schnell"
+    resolution: str = "1920x1080"
+    num_inference_steps: int = 20
+    seed: int = -1
+    guidance_scale: float = 7.5
+    output_dir: str = ""
+    image_guide: Optional[str] = None
+    reference_strength: float = 0.35
 
 
 def create_app(engine_globals: dict | None = None) -> FastAPI:
-    """Build the FastAPI app with auth and CORS configured.
-
-    Parameters
-    ----------
-    engine_globals : dict, optional
-        References to Wan2GP runtime objects injected by the plugin at
-        startup.  Expected keys:
-        - "model_types_handlers" : dict[str, handler]
-        - "families_infos" : dict[str, tuple[int, str]]
-    """
     app = FastAPI(
         title="BetterClip Engine API",
         version=API_VERSION,
@@ -32,11 +42,8 @@ def create_app(engine_globals: dict | None = None) -> FastAPI:
         redoc_url=None,
     )
 
-    # --- Auth ---------------------------------------------------------------
     token = get_or_create_token()
     app.add_middleware(TokenAuthMiddleware, token=token)
-
-    # --- CORS (localhost only) ----------------------------------------------
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
@@ -44,41 +51,21 @@ def create_app(engine_globals: dict | None = None) -> FastAPI:
         allow_headers=["X-BetterClip-Token", "Content-Type"],
     )
 
-    # --- Shared state -------------------------------------------------------
     _engine = engine_globals or {}
 
-    # --- Routes -------------------------------------------------------------
+    # --- Health ---------------------------------------------------------------
 
     @app.get("/health")
     async def health():
-        return {
-            "status": "ok",
-            "version": API_VERSION,
-            "engine": "Wan2GP",
-        }
+        return {"status": "ok", "version": API_VERSION, "engine": "Wan2GP"}
+
+    # --- Models (families) ----------------------------------------------------
 
     @app.get("/models")
     async def list_models():
-        """Return available model families and their supported types.
-
-        Response shape:
-        {
-          "families": {
-            "flux": {
-              "order": 100,
-              "label": "Flux 1",
-              "types": ["flux", "flux_schnell", ...]
-            },
-            ...
-          }
-        }
-        """
         handlers: dict = _engine.get("model_types_handlers", {})
         families_infos: dict = _engine.get("families_infos", {})
 
-        # Group model types by family
-        # Each handler has query_family_infos() → {"family_key": (order, label)}
-        # We reverse-map: for each model_type, find which family it belongs to
         family_types: dict[str, list[str]] = {}
         for model_type, handler in handlers.items():
             try:
@@ -87,12 +74,10 @@ def create_app(engine_globals: dict | None = None) -> FastAPI:
                 continue
             for fam_key in infos:
                 family_types.setdefault(fam_key, [])
-                # Only add if this type actually belongs to this family
                 if model_type in (handler.query_supported_types() or []):
                     if model_type not in family_types[fam_key]:
                         family_types[fam_key].append(model_type)
 
-        # Build response
         families = {}
         for fam_key, (order, label) in families_infos.items():
             if fam_key == "unknown":
@@ -104,5 +89,53 @@ def create_app(engine_globals: dict | None = None) -> FastAPI:
             }
 
         return {"families": families}
+
+    # --- Image generation models info -----------------------------------------
+
+    @app.get("/generate/models")
+    async def list_image_models():
+        handlers: dict = _engine.get("model_types_handlers", {})
+        available = get_available_models(handlers)
+        return {"models": available}
+
+    # --- Submit generation job ------------------------------------------------
+
+    @app.post("/generate")
+    async def generate(req: GenerateRequest):
+        job_id = submit_generation(
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            model_type=req.model_type,
+            resolution=req.resolution,
+            num_inference_steps=req.num_inference_steps,
+            seed=req.seed,
+            guidance_scale=req.guidance_scale,
+            output_dir=req.output_dir,
+            image_guide=req.image_guide,
+            reference_strength=req.reference_strength,
+        )
+        return {"job_id": job_id, "status": "queued"}
+
+    # --- Job status -----------------------------------------------------------
+
+    @app.get("/jobs/{job_id}")
+    async def job_status(job_id: str):
+        job = get_job(job_id)
+        if not job:
+            return {"error": "job not found"}, 404
+
+        result = {
+            "job_id": job.job_id,
+            "status": job.status,
+            "progress": job.progress,
+            "model_type": job.model_type,
+        }
+
+        if job.status == "completed":
+            result["output_path"] = job.output_path
+        elif job.status == "failed":
+            result["error"] = job.error
+
+        return result
 
     return app
