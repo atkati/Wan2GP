@@ -18,7 +18,10 @@ from typing import Optional
 
 from .config import API_VERSION, get_or_create_token
 from .auth import TokenAuthMiddleware
-from .generator import get_available_models, submit_generation, get_job, IMAGE_MODELS
+from .generator import (
+    get_available_models, get_available_video_models,
+    submit_generation, get_job, IMAGE_MODELS, VIDEO_MODELS,
+)
 
 
 class GenerateRequest(BaseModel):
@@ -33,6 +36,11 @@ class GenerateRequest(BaseModel):
     output_filename: str = ""
     image_guide: Optional[str] = None
     reference_strength: float = 0.35
+    # --- Champs video (defauts = comportement image inchange) ---
+    media_type: str = "image"        # "image" | "video"
+    num_frames: int = 1              # nombre d'images de la video
+    fps: int = 16                    # info de cadence (la cadence reelle vient du modele)
+    image_start: Optional[str] = None  # still de depart pour l'image-to-video
 
 
 def create_app(engine_globals: dict | None = None) -> FastAPI:
@@ -96,8 +104,10 @@ def create_app(engine_globals: dict | None = None) -> FastAPI:
     @app.get("/generate/models")
     async def list_image_models():
         handlers: dict = _engine.get("model_types_handlers", {})
-        available = get_available_models(handlers)
-        return {"models": available}
+        return {
+            "models": get_available_models(handlers),
+            "video_models": get_available_video_models(handlers),
+        }
 
     # --- Submit generation job ------------------------------------------------
 
@@ -115,6 +125,10 @@ def create_app(engine_globals: dict | None = None) -> FastAPI:
             output_filename=req.output_filename,
             image_guide=req.image_guide,
             reference_strength=req.reference_strength,
+            media_type=req.media_type,
+            num_frames=req.num_frames,
+            fps=req.fps,
+            image_start=req.image_start,
         )
         return {"job_id": job_id, "status": "queued"}
 
@@ -131,6 +145,7 @@ def create_app(engine_globals: dict | None = None) -> FastAPI:
             "status": job.status,
             "progress": job.progress,
             "model_type": job.model_type,
+            "media_type": job.media_type,
         }
 
         if job.status == "completed":

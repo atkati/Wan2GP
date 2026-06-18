@@ -29,6 +29,7 @@ class GenerationJob:
     status: str = "queued"
     prompt: str = ""
     model_type: str = ""
+    media_type: str = "image"  # "image" | "video"
     output_path: str = ""
     error: str = ""
     progress: int = 0
@@ -80,12 +81,81 @@ IMAGE_MODELS = {
 }
 
 
+VIDEO_MODELS = {
+    "ltxv_13B": {
+        "type": "ltxv_13B", "label": "LTX Video 13B", "family": "ltxv",
+        "caps": ["t2v", "i2v"], "speed": "fast", "vram": "~12 GB",
+        "estimated_time": "rapide",
+        "description": "Tres rapide, videos longues — ideal cuts promo / previews",
+    },
+    "t2v": {
+        "type": "t2v", "label": "Wan 2.1 T2V 14B", "family": "wan",
+        "caps": ["t2v"], "speed": "medium", "vram": "~12 GB",
+        "estimated_time": "moyen",
+        "description": "Texte -> video, bonne qualite generale",
+    },
+    "t2v_2_2": {
+        "type": "t2v_2_2", "label": "Wan 2.2 T2V", "family": "wan",
+        "caps": ["t2v"], "speed": "medium", "vram": "~12 GB",
+        "estimated_time": "moyen",
+        "description": "Texte -> video, derniere generation Wan",
+    },
+    "i2v": {
+        "type": "i2v", "label": "Wan 2.1 I2V 14B", "family": "wan",
+        "caps": ["i2v"], "speed": "medium", "vram": "~12 GB",
+        "estimated_time": "moyen",
+        "description": "Image -> video : anime un visuel fixe (still Flux)",
+    },
+    "i2v_2_2": {
+        "type": "i2v_2_2", "label": "Wan 2.2 I2V", "family": "wan",
+        "caps": ["i2v"], "speed": "medium", "vram": "~12 GB",
+        "estimated_time": "moyen",
+        "description": "Image -> video, derniere generation Wan",
+    },
+    "vace_14B": {
+        "type": "vace_14B", "label": "Vace 14B (reference)", "family": "vace",
+        "caps": ["t2v", "i2v", "reference"], "speed": "medium", "vram": "~14 GB",
+        "estimated_time": "moyen",
+        "description": "Conditionnement par reference perso/decor — verrou de coherence",
+    },
+    "vace_14B_2_2": {
+        "type": "vace_14B_2_2", "label": "Vace 14B 2.2 (reference)", "family": "vace",
+        "caps": ["t2v", "i2v", "reference"], "speed": "medium", "vram": "~14 GB",
+        "estimated_time": "moyen",
+        "description": "Vace 2.2 : reference perso/decor, meilleure coherence",
+    },
+    "hunyuan": {
+        "type": "hunyuan", "label": "Hunyuan Video T2V", "family": "hunyuan",
+        "caps": ["t2v"], "speed": "slow", "vram": "~12 GB",
+        "estimated_time": "lent",
+        "description": "Texte -> video, rendu cinematographique",
+    },
+    "hunyuan_i2v": {
+        "type": "hunyuan_i2v", "label": "Hunyuan Video I2V", "family": "hunyuan",
+        "caps": ["i2v"], "speed": "slow", "vram": "~12 GB",
+        "estimated_time": "lent",
+        "description": "Image -> video Hunyuan",
+    },
+    "flf2v_720p": {
+        "type": "flf2v_720p", "label": "Wan FLF2V 720p", "family": "wan",
+        "caps": ["flf2v"], "speed": "medium", "vram": "~14 GB",
+        "estimated_time": "moyen",
+        "description": "Premiere + derniere image -> video (transitions)",
+    },
+}
+
+
 def get_available_models(model_types_handlers: dict) -> list[dict]:
     available = []
     for model_key, info in IMAGE_MODELS.items():
         if model_key in model_types_handlers:
             available.append(info)
     return available
+
+
+def get_available_video_models(model_types_handlers: dict) -> list[dict]:
+    """Video models actually installed in this Wan2GP (same availability filter)."""
+    return [info for key, info in VIDEO_MODELS.items() if key in model_types_handlers]
 
 
 def _get_session():
@@ -122,6 +192,10 @@ def submit_generation(
     image_guide: Optional[str] = None,
     reference_strength: float = 0.35,
     output_filename: str = "",
+    media_type: str = "image",
+    num_frames: int = 1,
+    fps: int = 16,
+    image_start: Optional[str] = None,
 ) -> str:
     global _worker_running
 
@@ -131,13 +205,15 @@ def submit_generation(
         status="queued",
         prompt=prompt,
         model_type=model_type,
+        media_type=media_type,
     )
     with _jobs_lock:
         _jobs[job_id] = job
 
     args = (job, prompt, negative_prompt, model_type, resolution,
             num_inference_steps, seed, guidance_scale, output_dir,
-            image_guide, reference_strength, output_filename)
+            image_guide, reference_strength, output_filename,
+            media_type, num_frames, image_start)
 
     _pending_queue.append(args)
 
@@ -176,12 +252,18 @@ def _run_generation(
     image_guide: Optional[str],
     reference_strength: float,
     output_filename: str,
+    media_type: str,
+    num_frames: int,
+    image_start: Optional[str],
 ):
     try:
         job.status = "running"
         job.progress = 10
 
         session = _get_session()
+
+        # Debridage video : video_length > 1 => vraie video ; sinon 1 frame = image
+        is_video = (media_type == "video") and (num_frames or 0) > 1
 
         settings: dict[str, Any] = {
             "model_type": model_type,
@@ -191,15 +273,20 @@ def _run_generation(
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
             "batch_size": 1,
-            "video_length": 1,  # Force single frame = image
+            "video_length": num_frames if is_video else 1,
         }
 
         if seed >= 0:
             settings["seed"] = seed
 
+        # Image de reference (conditionnement style/perso)
         if image_guide and os.path.isfile(image_guide):
             settings["image_guide"] = image_guide
             settings["denoising_strength"] = reference_strength
+
+        # Image-to-video : still de depart anime par le modele I2V
+        if is_video and image_start and os.path.isfile(image_start):
+            settings["image_start"] = image_start
 
         job.progress = 20
 
@@ -211,29 +298,34 @@ def _run_generation(
             source_file = result.generated_files[0]
             print(f"[betterclip-gen] Generated: {source_file}")
 
-            # Copy/convert to target directory as PNG
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
-                fname = output_filename or f"frame_{job.job_id}.png"
-                target_path = os.path.join(output_dir, fname)
 
-                ext = os.path.splitext(source_file)[1].lower()
-                if ext in ('.png', '.jpg', '.jpeg', '.webp'):
-                    # Already an image — just copy
+                if is_video:
+                    # Conserver la video produite telle quelle (MP4)
+                    src_ext = os.path.splitext(source_file)[1].lower() or ".mp4"
+                    fname = output_filename or f"shot_{job.job_id}{src_ext}"
+                    target_path = os.path.join(output_dir, fname)
                     shutil.copy2(source_file, target_path)
                     job.output_path = target_path
-                elif ext in ('.mp4', '.webm', '.mkv'):
-                    # Video — extract first frame
-                    if _extract_first_frame(source_file, target_path):
-                        job.output_path = target_path
-                    else:
-                        # Fallback: copy as-is
-                        target_path = os.path.join(output_dir, fname.replace('.png', ext))
+                else:
+                    # Chemin image (MVP Lyrics) : copie ou extraction 1re frame
+                    fname = output_filename or f"frame_{job.job_id}.png"
+                    target_path = os.path.join(output_dir, fname)
+                    ext = os.path.splitext(source_file)[1].lower()
+                    if ext in ('.png', '.jpg', '.jpeg', '.webp'):
                         shutil.copy2(source_file, target_path)
                         job.output_path = target_path
-                else:
-                    shutil.copy2(source_file, target_path)
-                    job.output_path = target_path
+                    elif ext in ('.mp4', '.webm', '.mkv'):
+                        if _extract_first_frame(source_file, target_path):
+                            job.output_path = target_path
+                        else:
+                            target_path = os.path.join(output_dir, fname.replace('.png', ext))
+                            shutil.copy2(source_file, target_path)
+                            job.output_path = target_path
+                    else:
+                        shutil.copy2(source_file, target_path)
+                        job.output_path = target_path
 
                 print(f"[betterclip-gen] Saved to: {job.output_path}")
             else:
