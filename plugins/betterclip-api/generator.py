@@ -276,6 +276,11 @@ def _run_generation(
             "video_length": num_frames if is_video else 1,
         }
 
+        if is_video:
+            # Skip Layer Guidance (STG) desactive : sous offload son masque reste
+            # sur CPU et casse la generation ("cuda:0 and cpu", ex. LTX). Off = stable.
+            settings["perturbation_switch"] = 0
+
         if seed >= 0:
             settings["seed"] = seed
 
