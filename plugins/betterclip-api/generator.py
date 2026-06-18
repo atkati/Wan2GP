@@ -82,11 +82,17 @@ IMAGE_MODELS = {
 
 
 VIDEO_MODELS = {
+    "ltxv_distilled": {
+        "type": "ltxv_distilled", "label": "LTX Video 13B Distilled", "family": "ltxv",
+        "caps": ["t2v", "i2v"], "speed": "fast", "vram": "~12 GB",
+        "estimated_time": "tres rapide",
+        "description": "LTX distille : rapide, STG desactive -> stable sous offload (RECOMMANDE)",
+    },
     "ltxv_13B": {
         "type": "ltxv_13B", "label": "LTX Video 13B", "family": "ltxv",
         "caps": ["t2v", "i2v"], "speed": "fast", "vram": "~12 GB",
         "estimated_time": "rapide",
-        "description": "Tres rapide, videos longues — ideal cuts promo / previews",
+        "description": "LTX standard (STG actif) — peut planter sous offload ; prefere la version distilled",
     },
     "t2v": {
         "type": "t2v", "label": "Wan 2.1 T2V 14B", "family": "wan",
